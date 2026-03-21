@@ -1,0 +1,95 @@
+#!/bin/bash
+# lm-studio/ask — Query the local LM Studio model
+# Usage: ask "your prompt here"
+#        echo "your prompt" | ask
+#        ask --model "model-id" "prompt"
+#
+# LM Studio must be running with the local server enabled (port 1234).
+
+set -euo pipefail
+
+LM_HOST="${LM_STUDIO_HOST:-host.docker.internal}"
+LM_PORT="${LM_STUDIO_PORT:-1234}"
+LM_URL="http://${LM_HOST}:${LM_PORT}/v1"
+
+# Parse args
+MODEL=""
+PROMPT=""
+SYSTEM_PROMPT="You are a helpful assistant."
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model|-m) MODEL="$2"; shift 2 ;;
+    --system|-s) SYSTEM_PROMPT="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: ask [--model MODEL] [--system SYSTEM] PROMPT"
+      echo "       echo PROMPT | ask [--model MODEL] [--system SYSTEM]"
+      exit 0
+      ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+
+# Read from stdin if no prompt arg
+if [[ -z "$PROMPT" ]]; then
+  PROMPT=$(cat)
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Error: no prompt provided" >&2
+  exit 1
+fi
+
+# Auto-detect model if not specified
+if [[ -z "$MODEL" ]]; then
+  MODELS_JSON=$(curl -sf --connect-timeout 3 "${LM_URL}/models" 2>/dev/null || true)
+  if [[ -z "$MODELS_JSON" ]]; then
+    echo "Error: LM Studio not reachable at ${LM_URL}" >&2
+    echo "Make sure LM Studio is running with the local server enabled (port ${LM_PORT})." >&2
+    exit 1
+  fi
+  MODEL=$(echo "$MODELS_JSON" | grep -o '"id": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  if [[ -z "$MODEL" ]]; then
+    echo "Error: no model loaded in LM Studio" >&2
+    exit 1
+  fi
+fi
+
+# Build JSON payload
+# enable_thinking=false disables chain-of-thought for reasoning models (e.g. Qwen3),
+# preventing all tokens being consumed by internal reasoning before the answer.
+PAYLOAD=$(cat <<EOF
+{
+  "model": "$MODEL",
+  "messages": [
+    {"role": "system", "content": $(echo -n "$SYSTEM_PROMPT" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")},
+    {"role": "user",   "content": $(echo -n "$PROMPT /no_think" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 2048,
+  "stream": false
+}
+EOF
+)
+
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 \
+  -X POST "${LM_URL}/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" 2>/dev/null)
+
+if [[ -z "$RESPONSE" ]]; then
+  echo "Error: empty response from LM Studio" >&2
+  exit 1
+fi
+
+# Extract the assistant message content
+# Falls back to reasoning_content if content is empty (reasoning models)
+echo "$RESPONSE" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+msg = data['choices'][0]['message']
+content = msg.get('content', '').strip()
+if not content:
+    content = msg.get('reasoning_content', '').strip()
+print(content)
+"
